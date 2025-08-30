@@ -1,27 +1,24 @@
-# Gov Translation Tracker — single‑file Flask app (SQLite)
+# Gov Translation Tracker — Vercel-ready (Flask + Postgres)
 # -------------------------------------------------------
-# What this gives you
-# - A tiny web app you can run locally or on an internal server
-# - Add, view, search, edit, and export translation jobs
-# - Auto‑generated Doc ID like DOC-00001
-# - Fields: GO number, Translators (multi, comma‑separated), Deputy Director, Typist, Arrival Date, Submission Date
-# - CSV export
+# Runs on Vercel Functions (Python Runtime, WSGI). Uses a hosted Postgres DB.
+# Local dev still works with Postgres if DATABASE_URL is set.
 #
-# Quick start
-# 1) Install Python 3.9+ and pip
-# 2) pip install flask
-# 3) python app.py
-# 4) Open http://127.0.0.1:5000
+# What changed vs the SQLite version?
+# - Switched storage from SQLite to Postgres (Vercel cannot persist SQLite files)
+# - Uses psycopg3 with simple SQL (no ORM) and namedtuple rows for Jinja compatibility
+# - Same UI and fields. Auto Doc ID: DOC-00001
 #
-# Notes
-# - Data is stored in tracker.db (SQLite) in the same folder
-# - To back up, copy tracker.db
-# - You can safely delete tracker.db to start fresh (will recreate on next run)
+# Files you also need in the repo (shown below in chat):
+# - requirements.txt
+# - api/index.py
+# - vercel.json (rewrites everything to /api/index.py)
+#
+# Env vars required on Vercel:
+# - DATABASE_URL (or POSTGRES_URL) — e.g. postgresql://user:pass@host/db
 
 from __future__ import annotations
+import os
 import csv
-import sqlite3
-from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -36,19 +33,30 @@ from flask import (
     url_for,
 )
 
-APP_TITLE = "Gov Translation Tracker"
-DB_PATH = Path(__file__).with_name("tracker.db")
+import psycopg
+from psycopg.rows import namedtuple_row
 
-app = Flask(__name__)
+APP_TITLE = "Gov Translation Tracker"
 
 # --------------------- DB helpers ---------------------
 
-def get_db() -> sqlite3.Connection:
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+if not DATABASE_URL:
+    # Running on Vercel requires a hosted DB. For local dev, set DATABASE_URL.
+    raise RuntimeError(
+        "DATABASE_URL (or POSTGRES_URL) is not set. Provision a Postgres DB "
+        "(e.g. Neon / Vercel Postgres) and set the connection string as an env var."
+    )
+
+app = Flask(__name__)
+
+
+def get_db() -> psycopg.Connection:
     if "db" not in g:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        g.db = conn
+        # A fresh connection per request is simplest for serverless usage.
+        g.db = psycopg.connect(DATABASE_URL, row_factory=namedtuple_row)
     return g.db
+
 
 @app.teardown_appcontext
 def close_db(exception=None):
@@ -56,48 +64,49 @@ def close_db(exception=None):
     if db is not None:
         db.close()
 
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS work_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     doc_id TEXT UNIQUE,
     go_number TEXT NOT NULL,
     translators TEXT,
     deputy_director TEXT,
     typist TEXT,
-    arrival_date TEXT NOT NULL, -- YYYY-MM-DD
-    submission_date TEXT,       -- YYYY-MM-DD or NULL
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    arrival_date DATE NOT NULL,
+    submission_date DATE,
+    created_at TIMESTAMP DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_work_items_doc_id ON work_items(doc_id);
 CREATE INDEX IF NOT EXISTS idx_work_items_go_number ON work_items(go_number);
 """
 
+
 def init_db():
     db = get_db()
-    with closing(db.cursor()) as cur:
-        cur.executescript(SCHEMA_SQL)
+    with db.cursor() as cur:
+        cur.execute(SCHEMA_SQL)
         db.commit()
+
 
 @app.before_request
 def ensure_db():
-    # Create DB on first run
-    if not DB_PATH.exists():
-        DB_PATH.touch()
+    # Ensure tables exist on cold starts
     init_db()
+
 
 # --------------------- Utilities ---------------------
 
 def normalize_date(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
-    # Accept formats like 2025-08-30 or 30/08/2025
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y"):
         try:
             return datetime.strptime(s.strip(), fmt).strftime("%Y-%m-%d")
         except ValueError:
             pass
-    # fallback: return as-is; UI uses <input type=date> so this is rare
     return s.strip()
+
 
 # --------------------- Routes ---------------------
 
@@ -111,8 +120,11 @@ def index():
     params = []
 
     if q:
-        # Search over doc_id, go_number, translators, deputy_director, typist
-        conditions.append("(doc_id LIKE ? OR go_number LIKE ? OR translators LIKE ? OR deputy_director LIKE ? OR typist LIKE ?)")
+        # Case-insensitive search (ILIKE)
+        conditions.append(
+            "(doc_id ILIKE %s OR go_number ILIKE %s OR translators ILIKE %s OR "
+            "deputy_director ILIKE %s OR typist ILIKE %s)"
+        )
         like = f"%{q}%"
         params.extend([like, like, like, like, like])
 
@@ -124,15 +136,19 @@ def index():
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     sql = f"""
         SELECT id, doc_id, go_number, translators, deputy_director, typist,
-               arrival_date, submission_date,
+               TO_CHAR(arrival_date, 'YYYY-MM-DD') AS arrival_date,
+               TO_CHAR(submission_date, 'YYYY-MM-DD') AS submission_date,
                CASE WHEN submission_date IS NULL THEN 'In Progress' ELSE 'Submitted' END AS status
-        FROM work_items
-        {where}
-        ORDER BY id DESC
+          FROM work_items
+          {where}
+         ORDER BY id DESC
     """
-    rows = db.execute(sql, params).fetchall()
+    with db.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
 
     return render_template_string(TEMPLATE_INDEX, app_title=APP_TITLE, rows=rows, q=q, status=status)
+
 
 @app.route("/add", methods=["GET", "POST"])
 def add():
@@ -148,26 +164,31 @@ def add():
             return render_template_string(TEMPLATE_ADD, app_title=APP_TITLE, error="GO number and Arrival date are required.")
 
         db = get_db()
-        cur = db.execute(
-            """
-            INSERT INTO work_items (doc_id, go_number, translators, deputy_director, typist, arrival_date, submission_date)
-            VALUES (NULL, ?, ?, ?, ?, ?, ?)
-            """,
-            (go_number, translators, deputy_director, typist, arrival_date, submission_date),
-        )
-        new_id = cur.lastrowid
-        # Generate stable Doc ID: DOC-00001 style based on autoincrement id
-        doc_id = f"DOC-{new_id:05d}"
-        db.execute("UPDATE work_items SET doc_id=? WHERE id=?", (doc_id, new_id))
-        db.commit()
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO work_items (doc_id, go_number, translators, deputy_director, typist, arrival_date, submission_date)
+                VALUES (NULL, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (go_number, translators, deputy_director, typist, arrival_date, submission_date),
+            )
+            new_id = cur.fetchone().id
+            doc_id = f"DOC-{new_id:05d}"
+            cur.execute("UPDATE work_items SET doc_id=%s WHERE id=%s", (doc_id, new_id))
+            db.commit()
         return redirect(url_for("index"))
 
     return render_template_string(TEMPLATE_ADD, app_title=APP_TITLE)
 
+
 @app.route("/edit/<int:item_id>", methods=["GET", "POST"])
 def edit(item_id: int):
     db = get_db()
-    row = db.execute("SELECT * FROM work_items WHERE id=?", (item_id,)).fetchone()
+    with db.cursor() as cur:
+        cur.execute("SELECT *, TO_CHAR(arrival_date, 'YYYY-MM-DD') AS arrival_date_s, TO_CHAR(submission_date, 'YYYY-MM-DD') AS submission_date_s FROM work_items WHERE id=%s", (item_id,))
+        row = cur.fetchone()
+
     if not row:
         return redirect(url_for("index"))
 
@@ -179,57 +200,78 @@ def edit(item_id: int):
         arrival_date = normalize_date(request.form.get("arrival_date"))
         submission_date = normalize_date(request.form.get("submission_date"))
 
-        db.execute(
-            """
-            UPDATE work_items
-               SET go_number=?, translators=?, deputy_director=?, typist=?, arrival_date=?, submission_date=?
-             WHERE id=?
-            """,
-            (go_number, translators, deputy_director, typist, arrival_date, submission_date, item_id),
-        )
-        db.commit()
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE work_items
+                   SET go_number=%s, translators=%s, deputy_director=%s, typist=%s, arrival_date=%s, submission_date=%s
+                 WHERE id=%s
+                """,
+                (go_number, translators, deputy_director, typist, arrival_date, submission_date, item_id),
+            )
+            db.commit()
         return redirect(url_for("index"))
 
-    return render_template_string(TEMPLATE_EDIT, app_title=APP_TITLE, row=row)
+    # Adapt for template values
+    class RowWrap:
+        def __init__(self, r):
+            self.id = r.id
+            self.doc_id = r.doc_id
+            self.go_number = r.go_number
+            self.translators = r.translators
+            self.deputy_director = r.deputy_director
+            self.typist = r.typist
+            self.arrival_date = r.arrival_date_s
+            self.submission_date = r.submission_date_s
+
+    return render_template_string(TEMPLATE_EDIT, app_title=APP_TITLE, row=RowWrap(row))
+
 
 @app.route("/mark_submitted/<int:item_id>", methods=["POST"])
 def mark_submitted(item_id: int):
     today = datetime.now().strftime("%Y-%m-%d")
     db = get_db()
-    db.execute("UPDATE work_items SET submission_date=? WHERE id=?", (today, item_id))
-    db.commit()
+    with db.cursor() as cur:
+        cur.execute("UPDATE work_items SET submission_date=%s WHERE id=%s", (today, item_id))
+        db.commit()
     return redirect(url_for("index"))
+
 
 @app.route("/delete/<int:item_id>", methods=["POST"])
 def delete(item_id: int):
     db = get_db()
-    db.execute("DELETE FROM work_items WHERE id=?", (item_id,))
-    db.commit()
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM work_items WHERE id=%s", (item_id,))
+        db.commit()
     return redirect(url_for("index"))
+
 
 @app.route("/export.csv")
 def export_csv():
     db = get_db()
-    rows = db.execute(
-        """
-        SELECT doc_id, go_number, translators, deputy_director, typist,
-               arrival_date, submission_date
-          FROM work_items
-         ORDER BY id
-        """
-    ).fetchall()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT doc_id, go_number, translators, deputy_director, typist,
+                   TO_CHAR(arrival_date, 'YYYY-MM-DD') AS arrival_date,
+                   COALESCE(TO_CHAR(submission_date, 'YYYY-MM-DD'), '') AS submission_date
+              FROM work_items
+             ORDER BY id
+            """
+        )
+        rows = cur.fetchall()
 
-    # Write to a temporary CSV
-    tmp = Path("export.csv")
+    tmp = Path("/tmp/translation-tracker.csv")
     with tmp.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
             "Doc ID", "GO Number", "Translators", "Deputy Director", "Typist", "Arrival Date", "Submission Date",
         ])
         for r in rows:
-            writer.writerow([r["doc_id"], r["go_number"], r["translators"], r["deputy_director"], r["typist"], r["arrival_date"], r["submission_date"]])
+            writer.writerow([r.doc_id, r.go_number, r.translators, r.deputy_director, r.typist, r.arrival_date, r.submission_date])
 
     return send_file(tmp, as_attachment=True, download_name="translation-tracker.csv")
+
 
 # --------------------- Templates ---------------------
 
@@ -416,11 +458,8 @@ TEMPLATE_EDIT = """
 """
 
 # Jinja needs BASE_HTML in context when using render_template_string and "extends none"
-# so we inject it into the globals here.
 @app.context_processor
 def inject_base():
     return {"BASE_HTML": BASE_HTML}
 
-if __name__ == "__main__":
-    # For internal networks you might set host="0.0.0.0"; keep debug=False in production
-    app.run(debug=True)
+# No app.run() here — Vercel imports `app` via api/index.py
